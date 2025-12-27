@@ -2,11 +2,10 @@
 set -Eeuo pipefail
 
 # =========================
-#  createproxy.sh (Improved)
+#  createproxy.sh (Fixed + .env)
 # =========================
 
 # ====== Self-update (optional) ======
-# Đổi URL này thành raw của bạn nếu cần
 UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/letanluc310300/taoproxy/refs/heads/main/creatproxy.sh"
 
 self_update() {
@@ -22,16 +21,51 @@ self_update() {
   echo "[*] Chạy lại: sudo bash $target"
 }
 
-# Nếu chạy kiểu: sudo bash createproxy.sh --update
 if [[ "${1:-}" == "--update" ]]; then
   self_update "${2:-$UPDATE_URL_DEFAULT}" "${3:-/usr/local/bin/createproxy.sh}"
   exit 0
 fi
 
-# === Telegram Bot Config (chỉ dùng nếu chọn gửi) ===
-# Ưu tiên lấy từ ENV để tránh hardcode:
-# export BOT_TOKEN="xxx"
-# export CHAT_ID="yyy"
+# ===== Helpers =====
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+log()  { echo "${CYN}[*]${RST} $*"; }
+ok()   { echo "${GRN}[✓]${RST} $*"; }
+warn() { echo "${YEL}[!]${RST} $*"; }
+die()  { echo "${RED}[x]${RST} $*" >&2; exit 1; }
+
+cleanup_on_error() { warn "Có lỗi. Kiểm tra: systemctl status squid và /var/log/squid/"; }
+trap cleanup_on_error ERR
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Vui lòng chạy bằng root: sudo bash createproxy.sh"
+  fi
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ===== Load .env (BOT_TOKEN/CHAT_ID) =====
+load_env() {
+  # Ưu tiên .env cùng thư mục script, nếu không có thì /root/.env
+  local script_dir env_file
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$script_dir/.env" ]]; then
+    env_file="$script_dir/.env"
+  elif [[ -f "/root/.env" ]]; then
+    env_file="/root/.env"
+  else
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  set +u
+  source "$env_file"
+  set -u
+}
+
+# ===== Telegram Bot Config (lấy từ .env hoặc ENV system) =====
+# Không hardcode token/chat_id trong script để an toàn
+load_env
 BOT_TOKEN="${BOT_TOKEN:-}"
 CHAT_ID="${CHAT_ID:-}"
 
@@ -43,24 +77,6 @@ DEFAULT_PASS="kingproxy"
 SQUID_CONF="/etc/squid/squid.conf"
 SQUID_PASSWD="/etc/squid/passwd"
 SQUID_LOG="/var/log/squid/access.log"
-
-# ===== Helpers =====
-RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
-log()  { echo "${CYN}[*]${RST} $*"; }
-ok()   { echo "${GRN}[✓]${RST} $*"; }
-warn() { echo "${YEL}[!]${RST} $*"; }
-die()  { echo "${RED}[x]${RST} $*" >&2; exit 1; }
-
-cleanup_on_error() { warn "Có lỗi xảy ra. Kiểm tra: systemctl status squid và /var/log/squid/"; }
-trap cleanup_on_error ERR
-
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "Vui lòng chạy bằng root: sudo bash createproxy.sh"
-  fi
-}
-
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 detect_pkg_mgr() {
   if have_cmd apt-get; then echo "apt"
@@ -82,7 +98,7 @@ install_packages() {
     apt-get install -y squid apache2-utils curl
   elif [[ "$pmgr" == "yum" ]]; then
     yum install -y squid httpd-tools curl
-  elif [[ "$pmgr" == "dnf" ]]; then
+  else
     dnf install -y squid httpd-tools curl
   fi
   ok "Cài đặt xong"
@@ -108,14 +124,13 @@ find_basic_auth_bin() {
 
 random_port() {
   local port
-  for _ in {1..50}; do
+  for _ in {1..80}; do
     port=$((RANDOM % 63000 + 2000))
     if have_cmd ss; then
       if ! ss -lnt | awk '{print $4}' | grep -q ":$port$"; then
         echo "$port"; return 0
       fi
     else
-      # fallback nếu thiếu ss
       if ! (netstat -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$port$"); then
         echo "$port"; return 0
       fi
@@ -193,8 +208,8 @@ restart_squid() {
 send_telegram() {
   local ip="$1" port="$2" user="$3" pass="$4"
 
-  if [[ "$BOT_TOKEN" == "YOUR_BOT_TOKEN" || "$CHAT_ID" == "YOUR_CHAT_ID" ]]; then
-    warn "Bạn chọn gửi Telegram nhưng BOT_TOKEN/CHAT_ID chưa set. Bỏ qua."
+  if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+    warn "Bạn chọn gửi Telegram nhưng BOT_TOKEN/CHAT_ID chưa có. Hãy set trong .env hoặc export ENV."
     return 0
   fi
 
