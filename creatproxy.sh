@@ -32,8 +32,8 @@ fi
 # Ưu tiên lấy từ ENV để tránh hardcode:
 # export BOT_TOKEN="xxx"
 # export CHAT_ID="yyy"
-BOT_TOKEN="7737030927:AAEmdQNSxxKE7HgnhyOAORuqoRYMFcPnWGc"
-CHAT_ID="6267128183"
+BOT_TOKEN="${BOT_TOKEN:7737030927:AAEmdQNSxxKE7HgnhyOAORuqoRYMFcPnWGc}"
+CHAT_ID="${CHAT_ID:6267128183}"
 
 # === Default user/pass nếu không nhập ===
 DEFAULT_USER="kingproxy"
