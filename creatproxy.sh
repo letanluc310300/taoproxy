@@ -1,335 +1,261 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===========================
-#  Proxy Squid Installer v2
-#  - Fix unbound variables
-#  - Interactive + args mode
-#  - Telegram optional
-#  - Self-update from GitHub raw
-# ===========================
+# =========================
+#  createproxy.sh (Improved)
+# =========================
 
-SCRIPT_NAME="creatproxy.sh"
+# === Telegram Bot Config (chỉ dùng nếu chọn gửi) ===
+BOT_TOKEN="$7737030927:AAEmdQNSxxKE7HgnhyOAORuqoRYMFcPnWGc"
+CHAT_ID="$6267128183"
+
+# === Default user/pass nếu không nhập ===
+DEFAULT_USER="kingproxy"
+DEFAULT_PASS="kingproxy"
+
+# === Squid config ===
 SQUID_CONF="/etc/squid/squid.conf"
 SQUID_PASSWD="/etc/squid/passwd"
 SQUID_LOG="/var/log/squid/access.log"
 
-# --- CHANGE THIS to your GitHub RAW (direct file) ---
-# Example:
-# UPDATE_URL="https://raw.githubusercontent.com/<user>/<repo>/main/creatproxy.sh"
-UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/letanluc310300/taoproxy/refs/heads/main/creatproxy.sh}"
+# ===== Helpers =====
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+log()  { echo "${CYN}[*]${RST} $*"; }
+ok()   { echo "${GRN}[✓]${RST} $*"; }
+warn() { echo "${YEL}[!]${RST} $*"; }
+die()  { echo "${RED}[x]${RST} $*" >&2; exit 1; }
 
-# Telegram (optional)
-BOT_TOKEN="$7737030927:AAEmdQNSxxKE7HgnhyOAORuqoRYMFcPnWGc"
-CHAT_ID="$6267128183"
-
-log()  { echo -e "[$(date +'%F %T')] $*"; }
-die()  { echo -e "❌ $*" >&2; exit 1; }
+cleanup_on_error() {
+  warn "Có lỗi xảy ra. Bạn có thể xem log/systemctl status squid để biết thêm."
+}
+trap cleanup_on_error ERR
 
 need_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Hãy chạy bằng root. Ví dụ: sudo bash $SCRIPT_NAME"
-}
-
-detect_pkg_mgr() {
-  if command -v apt >/dev/null 2>&1; then
-    echo "apt"
-  elif command -v yum >/dev/null 2>&1; then
-    echo "yum"
-  elif command -v dnf >/dev/null 2>&1; then
-    echo "dnf"
-  else
-    die "Không tìm thấy apt/yum/dnf."
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Vui lòng chạy bằng root: sudo bash createproxy.sh"
   fi
 }
 
-install_deps() {
-  local pm
-  pm="$(detect_pkg_mgr)"
-  log "➡️  Installing dependencies (squid, apache2-utils/htpasswd, curl)..."
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-  case "$pm" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt update -y
-      apt install -y squid apache2-utils curl
-      ;;
-    yum)
-      yum install -y squid httpd-tools curl
-      ;;
-    dnf)
-      dnf install -y squid httpd-tools curl
-      ;;
-  esac
+detect_pkg_mgr() {
+  if have_cmd apt-get; then
+    echo "apt"
+  elif have_cmd yum; then
+    echo "yum"
+  elif have_cmd dnf; then
+    echo "dnf"
+  else
+    echo ""
+  fi
+}
+
+install_packages() {
+  local pmgr
+  pmgr="$(detect_pkg_mgr)"
+  [[ -n "$pmgr" ]] || die "Không tìm thấy trình quản lý gói (apt/yum/dnf)."
+
+  log "Cài đặt gói cần thiết: squid + apache2-utils + curl"
+  if [[ "$pmgr" == "apt" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y squid apache2-utils curl
+  elif [[ "$pmgr" == "yum" ]]; then
+    yum install -y squid httpd-tools curl
+  elif [[ "$pmgr" == "dnf" ]]; then
+    dnf install -y squid httpd-tools curl
+  fi
+  ok "Cài đặt xong"
+}
+
+find_basic_auth_bin() {
+  # các đường dẫn phổ biến
+  local candidates=(
+    "/usr/lib/squid/basic_ncsa_auth"
+    "/usr/lib64/squid/basic_ncsa_auth"
+    "/usr/lib/squid3/basic_ncsa_auth"
+    "/usr/libexec/squid/basic_ncsa_auth"
+    "/usr/libexec/basic_ncsa_auth"
+  )
+  for p in "${candidates[@]}"; do
+    if [[ -x "$p" ]]; then
+      echo "$p"
+      return 0
+    fi
+  done
+
+  # fallback: tìm nhanh
+  local found
+  found="$(find /usr -type f -name basic_ncsa_auth 2>/dev/null | head -n 1 || true)"
+  [[ -n "$found" && -x "$found" ]] && { echo "$found"; return 0; }
+
+  return 1
 }
 
 random_port() {
-  # 2000-65000
-  echo $(( (RANDOM % 63000) + 2000 ))
+  # ưu tiên port ngẫu nhiên nhưng đảm bảo chưa dùng
+  local port
+  for _ in {1..50}; do
+    port=$((RANDOM % 63000 + 2000))
+    if ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$port$"; then
+      echo "$port"
+      return 0
+    fi
+  done
+  # fallback nếu xui
+  echo "3128"
 }
 
-get_public_ip() {
-  # ưu tiên IPv4
-  curl -s -4 ifconfig.me 2>/dev/null || true
+get_public_ipv4() {
+  # ifconfig.me đôi khi chập chờn -> có fallback
+  local ip=""
+  ip="$(curl -fsS -4 --max-time 8 ifconfig.me 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsS -4 --max-time 8 api.ipify.org 2>/dev/null || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsS -4 --max-time 8 icanhazip.com 2>/dev/null || true)"
+  fi
+  echo "${ip//[$'\r\n ']/}"
 }
 
-ensure_htpasswd() {
-  command -v htpasswd >/dev/null 2>&1 || die "Thiếu htpasswd. Hãy cài apache2-utils/httpd-tools."
+backup_conf() {
+  if [[ -f "$SQUID_CONF" ]]; then
+    cp -a "$SQUID_CONF" "${SQUID_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+    ok "Đã backup squid.conf"
+  fi
 }
 
 write_squid_conf() {
-  local port="$1"
-  cp -f "$SQUID_CONF" "${SQUID_CONF}.bak.$(date +%s)" 2>/dev/null || true
+  local auth_bin="$1"
+  local port="$2"
+
+  mkdir -p "$(dirname "$SQUID_PASSWD")"
+  mkdir -p "$(dirname "$SQUID_LOG")"
 
   cat > "$SQUID_CONF" <<EOF
-# Generated by Proxy Squid Installer v2
-auth_param basic program /usr/lib/squid/basic_ncsa_auth $SQUID_PASSWD
+# ===== Auto-generated by createproxy.sh =====
+# Basic authentication
+auth_param basic program $auth_bin $SQUID_PASSWD
 auth_param basic realm ProxyKing
 acl authenticated proxy_auth REQUIRED
+
+# Access rules
 http_access allow authenticated
+http_access deny all
+
+# Listen port
 http_port $port
 
+# No caching
 cache deny all
+
+# Logging
 access_log $SQUID_LOG
 EOF
+
+  ok "Đã ghi cấu hình Squid"
+}
+
+create_user() {
+  local user="$1"
+  local pass="$2"
+
+  # -b: batch mode; -c: create file; dùng -c chỉ khi file chưa tồn tại
+  if [[ -f "$SQUID_PASSWD" ]]; then
+    htpasswd -b "$SQUID_PASSWD" "$user" "$pass" >/dev/null
+  else
+    htpasswd -bc "$SQUID_PASSWD" "$user" "$pass" >/dev/null
+  fi
+  ok "Đã tạo user xác thực"
 }
 
 restart_squid() {
-  systemctl enable squid >/dev/null 2>&1 || true
-  systemctl restart squid
-  systemctl --no-pager --full status squid | sed -n '1,10p' || true
+  # service name có thể là squid hoặc squid3
+  if systemctl list-unit-files | grep -q '^squid\.service'; then
+    systemctl enable --now squid >/dev/null 2>&1 || true
+    systemctl restart squid
+    systemctl is-active --quiet squid || die "Squid không chạy (squid)."
+  elif systemctl list-unit-files | grep -q '^squid3\.service'; then
+    systemctl enable --now squid3 >/dev/null 2>&1 || true
+    systemctl restart squid3
+    systemctl is-active --quiet squid3 || die "Squid không chạy (squid3)."
+  else
+    # fallback
+    systemctl restart squid 2>/dev/null || systemctl restart squid3 2>/dev/null || die "Không restart được Squid."
+  fi
+  ok "Squid đã restart"
 }
 
 send_telegram() {
-  local msg="$1"
-  # Nếu chưa set token/chat_id thì bỏ qua
+  local ip="$1" port="$2" user="$3" pass="$4"
+
+  # nếu user chưa set token/chat id thì bỏ qua để tránh fail
   if [[ "$BOT_TOKEN" == "YOUR_BOT_TOKEN" || "$CHAT_ID" == "YOUR_CHAT_ID" ]]; then
-    log "ℹ️  Telegram chưa cấu hình BOT_TOKEN/CHAT_ID nên bỏ qua gửi."
+    warn "Bạn chọn gửi Telegram nhưng BOT_TOKEN/CHAT_ID chưa được cấu hình. Bỏ qua."
     return 0
   fi
 
-  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d chat_id="$CHAT_ID" \
-    --data-urlencode text="$msg" >/dev/null || true
+  local msg
+  msg="✅ Proxy mới đã được tạo:
+Định dạng: ${ip}:${port}:${user}:${pass}"
+
+  curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${CHAT_ID}" \
+    -d "text=${msg}" >/dev/null || warn "Gửi Telegram thất bại (token/chat id/network)."
+  ok "Đã gửi Telegram"
 }
 
-add_user() {
-  local username="$1"
-  local password="$2"
-  ensure_htpasswd
-  htpasswd -bc "$SQUID_PASSWD" "$username" "$password" >/dev/null
-}
+# ===== Main =====
+need_root
+install_packages
 
-show_info() {
-  local ip port
-  ip="$(get_public_ip)"
-  if [[ -f "$SQUID_CONF" ]]; then
-    port="$(grep -E '^http_port ' "$SQUID_CONF" | awk '{print $2}' | head -n1 || true)"
-  else
-    port=""
-  fi
+# ==== hỏi user/pass ====
+read -r -p "Bạn muốn nhập username? (y/n): " choice
+if [[ "$choice" =~ ^[yY]$ ]]; then
+  read -r -p "Nhập username: " USERNAME
+  # random pass 10 ký tự
+  PASSWORD="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 10)"
+  [[ -n "${USERNAME// }" ]] || die "Username rỗng."
+else
+  USERNAME="$DEFAULT_USER"
+  PASSWORD="$DEFAULT_PASS"
+fi
 
-  echo "===================================="
-  echo "🧾 Squid config: $SQUID_CONF"
-  echo "👤 Passwd file : $SQUID_PASSWD"
-  echo "📄 Log         : $SQUID_LOG"
-  echo "🌐 Public IPv4 : ${ip:-"(không lấy được)"}"
-  echo "🔌 Port        : ${port:-"(chưa cấu hình)"}"
-  echo "===================================="
-}
+# ==== hỏi gửi telegram ====
+read -r -p "Bạn có muốn gửi thông tin proxy về Telegram? (y/n): " send_tele
 
-uninstall_all() {
-  local pm
-  pm="$(detect_pkg_mgr)"
-  log "⚠️  Uninstall squid & remove config..."
-  systemctl stop squid >/dev/null 2>&1 || true
+# ==== chọn port ====
+PORT="$(random_port)"
 
-  rm -f "$SQUID_PASSWD" || true
-  rm -f "$SQUID_CONF" || true
+# ==== tìm basic_ncsa_auth ====
+AUTH_BIN="$(find_basic_auth_bin || true)"
+[[ -n "$AUTH_BIN" ]] || die "Không tìm thấy basic_ncsa_auth. Hãy kiểm tra cài squid đúng chưa."
 
-  case "$pm" in
-    apt) apt remove -y squid apache2-utils || true ;;
-    yum) yum remove -y squid httpd-tools || true ;;
-    dnf) dnf remove -y squid httpd-tools || true ;;
-  esac
+# ==== tạo user ====
+create_user "$USERNAME" "$PASSWORD"
 
-  log "✅ Done uninstall."
-}
+# ==== ghi config ====
+backup_conf
+write_squid_conf "$AUTH_BIN" "$PORT"
+restart_squid
 
-self_update() {
-  need_root
-  log "⬇️  Updating script from: $UPDATE_URL"
-  local tmp="/tmp/${SCRIPT_NAME}.$RANDOM"
-  curl -fsSL "$UPDATE_URL" -o "$tmp" || die "Không tải được UPDATE_URL (check link raw)."
-  chmod +x "$tmp"
+# ==== lấy ip ====
+IP="$(get_public_ipv4)"
+[[ -n "$IP" ]] || warn "Không lấy được IP công khai IPv4. Bạn có thể tự kiểm tra bằng: curl -4 ifconfig.me"
 
-  # Replace current script if possible
-  if [[ -w "$0" ]]; then
-    cp -f "$tmp" "$0"
-    chmod +x "$0"
-    log "✅ Updated in-place: $0"
-  else
-    # fallback install to /usr/local/bin
-    cp -f "$tmp" "/usr/local/bin/$SCRIPT_NAME"
-    chmod +x "/usr/local/bin/$SCRIPT_NAME"
-    log "✅ Installed updated script to: /usr/local/bin/$SCRIPT_NAME"
-    log "👉 Lần sau chạy: sudo $SCRIPT_NAME ..."
-  fi
-}
+# ==== in kết quả ====
+echo "===================================="
+echo " ✅ Proxy đã tạo thành công"
+echo "    Định dạng: ${IP:-UNKNOWN_IP}:$PORT:$USERNAME:$PASSWORD"
+echo
+echo " 🌐 IP: ${IP:-UNKNOWN_IP}"
+echo " 🔌 PORT: $PORT"
+echo " 👤 USER: $USERNAME"
+echo " 🔑 PASS: $PASSWORD"
+echo "===================================="
 
-usage() {
-  cat <<'EOF'
-Usage:
-  sudo bash creatproxy.sh [command] [options]
-
-Commands:
-  install         Cài squid + tạo user + cấu hình port
-  adduser         Thêm user/password (không đổi port)
-  show            Xem thông tin cấu hình
-  uninstall       Gỡ squid + xóa config
-  update          Tự cập nhật script từ GitHub raw
-
-Options (for install/adduser):
-  --user USER
-  --pass PASS
-  --port PORT
-  --send-tele y|n
-
-Examples:
-  sudo bash creatproxy.sh install --user abc --pass 123 --port 3128 --send-tele y
-  sudo bash creatproxy.sh adduser --user abc --pass 123
-  sudo bash creatproxy.sh update
-
-EOF
-}
-
-# --- parse args safely ---
-CMD="${1:-}"
-shift || true
-
-USER_ARG=""
-PASS_ARG=""
-PORT_ARG=""
-SEND_TELE=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --user) USER_ARG="${2:-}"; shift 2 || true ;;
-    --pass) PASS_ARG="${2:-}"; shift 2 || true ;;
-    --port) PORT_ARG="${2:-}"; shift 2 || true ;;
-    --send-tele) SEND_TELE="${2:-}"; shift 2 || true ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "Tham số không hợp lệ: $1 (dùng --help)" ;;
-  esac
-done
-
-interactive_install() {
-  local username password port send_tele ip
-  read -rp "Bạn muốn nhập username? (y/n): " choice || true
-  if [[ "${choice:-n}" =~ ^[yY]$ ]]; then
-    read -rp "Nhập username: " username
-    password="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 10)"
-  else
-    username="kingproxy"
-    password="kingproxy"
-  fi
-
-  read -rp "Bạn muốn chọn port? (y/n): " pchoice || true
-  if [[ "${pchoice:-n}" =~ ^[yY]$ ]]; then
-    read -rp "Nhập port (1-65535): " port
-  else
-    port="$(random_port)"
-  fi
-
-  read -rp "Gửi về Telegram? (y/n): " send_tele || true
-
-  install_deps
-  add_user "$username" "$password"
-  write_squid_conf "$port"
-  restart_squid
-
-  ip="$(get_public_ip)"
-  echo "===================================="
-  echo " ✅ Proxy đã tạo thành công"
-  echo "    Định dạng: ${ip:-IP_UNKNOWN}:$port:$username:$password"
-  echo "===================================="
-
-  if [[ "${send_tele:-n}" =~ ^[yY]$ ]]; then
-    send_telegram "✅ Proxy mới:
-${ip:-IP_UNKNOWN}:$port:$username:$password"
-  fi
-}
-
-noninteractive_install() {
-  local username password port send_tele ip
-  username="${USER_ARG:-kingproxy}"
-  password="${PASS_ARG:-kingproxy}"
-  port="${PORT_ARG:-$(random_port)}"
-  send_tele="${SEND_TELE:-n}"
-
-  install_deps
-  add_user "$username" "$password"
-  write_squid_conf "$port"
-  restart_squid
-
-  ip="$(get_public_ip)"
-  echo "===================================="
-  echo " ✅ Proxy đã tạo thành công"
-  echo "    Định dạng: ${ip:-IP_UNKNOWN}:$port:$username:$password"
-  echo "===================================="
-
-  if [[ "${send_tele}" =~ ^[yY]$ ]]; then
-    send_telegram "✅ Proxy mới:
-${ip:-IP_UNKNOWN}:$port:$username:$password"
-  fi
-}
-
-do_adduser() {
-  need_root
-  install_deps
-  local username password
-  username="${USER_ARG:-}"
-  password="${PASS_ARG:-}"
-
-  if [[ -z "$username" ]]; then
-    read -rp "Nhập username: " username
-  fi
-  if [[ -z "$password" ]]; then
-    read -rp "Nhập password: " password
-  fi
-
-  add_user "$username" "$password"
-  restart_squid
-  log "✅ Added/updated user: $username"
-}
-
-main() {
-  case "${CMD:-}" in
-    install|"")
-      need_root
-      if [[ -n "$USER_ARG" || -n "$PASS_ARG" || -n "$PORT_ARG" || -n "$SEND_TELE" ]]; then
-        noninteractive_install
-      else
-        interactive_install
-      fi
-      ;;
-    adduser)
-      do_adduser
-      ;;
-    show)
-      show_info
-      ;;
-    uninstall)
-      need_root
-      uninstall_all
-      ;;
-    update)
-      self_update
-      ;;
-    *)
-      usage
-      die "Command không hợp lệ: ${CMD:-"(rỗng)"}"
-      ;;
-  esac
-}
-
-main
+# ==== gửi telegram nếu chọn ====
+if [[ "$send_tele" =~ ^[yY]$ ]]; then
+  send_telegram "${IP:-UNKNOWN_IP}" "$PORT" "$USERNAME" "$PASSWORD"
+fi
